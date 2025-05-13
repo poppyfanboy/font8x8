@@ -1,8 +1,14 @@
+// TODO: Add PCF format and try it out within xterm (xterm -fa 'font name').
+// TODO: Add BDF format, because it's easier to write a BDF parser than a PCF parser.
+// TODO: Add XNA style image format, so that you could load it into raylib with LoadFontFromImage.
+// TODO: Raylib as well https://www.reddit.com/r/raylib/comments/1b96jcb/how_to_use_bitmap_fonts
+// TODO: Try to vectorize the font and export it into TTF just as an excuse to learn about TTF?
+
 #include <stdbool.h>    // bool, true, false
 #include <assert.h>     // assert
 #include <stddef.h>     // NULL, size_t
-#include <string.h>     // memcpy
-#include <stdlib.h>     // abort, malloc, free
+#include <string.h>     // memcpy, strcpy
+#include <stdlib.h>     // abort, malloc, free, qsort
 #include <stdio.h>      // FILE, fopen, fclose, ftell, fseek, fread, ferror, fprintf, stderr,
                         // fflush, printf
 
@@ -114,7 +120,7 @@ typedef struct {
 //
 // (Codes greater than 0x10ffff are invalid.)
 // 4 bytes: 0b11110000 .. 0b11110100 = 0xf0 .. 0xf4
-static u8 utf8_char_size[] = {
+u8 utf8_char_size[] = {
 //  0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 1
@@ -183,6 +189,13 @@ bool utf8_validate(StringView string) {
             return false;
         }
 
+        // Validate UTF8 tail bytes.
+        for (isize i = 1; i < char_size; i += 1) {
+            if ((string.data[i] & 0xc0) != 0x80) {
+                return false;
+            }
+        }
+
         u32 char_code;
         utf8_chop_char(&string, &char_code);
 
@@ -220,7 +233,7 @@ typedef struct {
     isize capacity;
 } String;
 
-static inline StringView as_string_view(String string) {
+StringView as_string_view(String string) {
     return (StringView){string.data, string.size};
 }
 
@@ -263,6 +276,8 @@ bool file_read_to_string(char const *file_path, String *string, Arena *arena) {
     return true;
 }
 
+#define FONT_NAME "font8x8"
+#define FONT_SCALE 2
 #define GLYPH_WIDTH 8
 #define GLYPH_HEIGHT 8
 
@@ -272,15 +287,19 @@ typedef struct {
     u32 *bitmap;
 } Glyph;
 
+int glyph_compare(void const *left, void const *right) {
+    return (i32)((Glyph const *)left)->char_code - (i32)((Glyph const *)right)->char_code;
+}
+
 void glyphs_print(Glyph *glyphs, isize glyph_count) {
     Glyph *glyph_iter = glyphs;
     Glyph *glyphs_end = glyphs + glyph_count;
 
     while (glyph_iter < glyphs_end) {
         printf("'%s' (U+%x)\n", glyph_iter->char_data, glyph_iter->char_code);
-        for (isize y = 0; y < GLYPH_HEIGHT; y += 1) {
-            for (isize x = 0; x < GLYPH_WIDTH; x += 1) {
-                u8 alpha = (glyph_iter->bitmap[y * GLYPH_WIDTH + x] >> 24) & 0xff;
+        for (isize y = 0; y < GLYPH_HEIGHT * FONT_SCALE; y += 1) {
+            for (isize x = 0; x < GLYPH_WIDTH * FONT_SCALE; x += 1) {
+                u8 alpha = (glyph_iter->bitmap[y * (GLYPH_WIDTH * FONT_SCALE) + x] >> 24) & 0xff;
                 printf("%c ", alpha == 0x00 ? ' ' : '@');
             }
             printf("\n");
@@ -289,6 +308,75 @@ void glyphs_print(Glyph *glyphs, isize glyph_count) {
         printf("\n");
         glyph_iter += 1;
     }
+}
+
+void glyphs_export_as_c_array(Glyph const *glyphs, isize glyph_count, FILE *output_file) {
+    fprintf(
+        output_file,
+        "// Generated file. Do not edit manually.\n"
+        "\n"
+        "#include <stdint.h>\n"
+        "\n"
+        "#define %s_glyph_width %d\n"
+        "#define %s_glyph_height %d\n"
+        "#define %s_glyph_count %ld\n"
+        "\n"
+        "static struct {\n"
+        "    uint32_t char_code;\n"
+        "    char const *char_data;\n"
+        "    uint32_t bitmap[%s_glyph_width * %s_glyph_height];\n"
+        "} %s_glyphs[%s_glyph_count] = {\n",
+        FONT_NAME, GLYPH_WIDTH * FONT_SCALE,
+        FONT_NAME, GLYPH_HEIGHT * FONT_SCALE,
+        FONT_NAME, glyph_count,
+        FONT_NAME, FONT_NAME,
+        FONT_NAME, FONT_NAME
+    );
+
+    Glyph const *glyph_iter = glyphs;
+    Glyph const *glyphs_end = glyphs + glyph_count;
+    while (glyph_iter != glyphs_end) {
+        // 1 byte for backslash + 4 bytes for UTF-8 char + 1 byte for null terminator
+        char escaped_char_data[6];
+        {
+            char *escaped_char_iter = escaped_char_data;
+            if (glyph_iter->char_code == '"' || glyph_iter->char_code == '\\') {
+                *escaped_char_iter = '\\';
+                escaped_char_iter += 1;
+            }
+            strcpy(escaped_char_iter, glyph_iter->char_data);
+        }
+
+        fprintf(
+            output_file,
+            "    {\n"
+            "        .char_code = %#x,\n"
+            "        .char_data = \"%s\",\n"
+            "        .bitmap = {\n",
+            glyph_iter->char_code,
+            escaped_char_data
+        );
+
+        for (isize glyph_y = 0; glyph_y < GLYPH_HEIGHT * FONT_SCALE; glyph_y += 1) {
+            fprintf(output_file, "           ");
+            for (isize glyph_x = 0; glyph_x < GLYPH_WIDTH * FONT_SCALE; glyph_x += 1) {
+                isize index = glyph_y * (GLYPH_WIDTH * FONT_SCALE) + glyph_x;
+                fprintf(output_file, " 0x%08x,", glyph_iter->bitmap[index]);
+            }
+            fprintf(output_file, "\n");
+        }
+
+        fprintf(
+            output_file,
+            "        },\n"
+            "    },\n"
+        );
+
+        glyph_iter += 1;
+    }
+
+    fprintf(output_file, "};\n");
+    fflush(output_file);
 }
 
 #define ARENA_CAPACITY (64 * 1024 * 1024)
@@ -322,6 +410,8 @@ int main(void) {
             }
         }
     }
+    // +1 for the whitespace character.
+    font_char_count += 1;
 
     struct {
         int width;
@@ -390,8 +480,11 @@ int main(void) {
                 memcpy(glyph_iter->char_data, char_data.data, (size_t)char_data.size);
                 glyph_iter->char_data[char_data.size] = 0;
 
-                glyph_iter->bitmap =
-                    arena_alloc_aligned(&arena, GLYPH_WIDTH * GLYPH_HEIGHT * sizeof(u32), 4);
+                glyph_iter->bitmap = arena_alloc_aligned(
+                    &arena,
+                    (GLYPH_WIDTH * FONT_SCALE) * (GLYPH_HEIGHT * FONT_SCALE) * sizeof(u32),
+                    4
+                );
 
                 u8 *glyph_line_start = &font.data[font_data_index * font.bytes_per_color];
 
@@ -399,10 +492,18 @@ int main(void) {
                     for (isize glyph_x = 0; glyph_x < GLYPH_WIDTH; glyph_x += 1) {
                         u8 color = glyph_line_start[glyph_x * font.bytes_per_color];
 
-                        if (color == 0x00) {
-                            glyph_iter->bitmap[glyph_y * GLYPH_WIDTH + glyph_x] = 0xff000000;
-                        } else {
-                            glyph_iter->bitmap[glyph_y * GLYPH_WIDTH + glyph_x] = 0x00000000;
+                        for (isize pixel_y = 0; pixel_y < FONT_SCALE; pixel_y += 1) {
+                            for (isize pixel_x = 0; pixel_x < FONT_SCALE; pixel_x += 1) {
+                                isize index =
+                                    (glyph_y * FONT_SCALE + pixel_y) * (GLYPH_WIDTH * FONT_SCALE) +
+                                    (glyph_x * FONT_SCALE + pixel_x);
+
+                                if (color == 0x00) {
+                                    glyph_iter->bitmap[index] = 0xffffffff;
+                                } else {
+                                    glyph_iter->bitmap[index] = 0x00000000;
+                                }
+                            }
                         }
                     }
 
@@ -414,12 +515,33 @@ int main(void) {
         }
     }
 
+    // Add the whitespace character.
+    glyph_iter->char_code = 0x0020;
+    glyph_iter->char_data = " ";
+    glyph_iter->bitmap = arena_alloc_aligned(
+        &arena,
+        (GLYPH_WIDTH * FONT_SCALE) * (GLYPH_HEIGHT * FONT_SCALE) * sizeof(u32),
+        4
+    );
+    for (isize i = 0; i < (GLYPH_WIDTH * FONT_SCALE) * (GLYPH_HEIGHT * FONT_SCALE); i += 1) {
+        glyph_iter->bitmap[i] = 0x00000000;
+    }
+    glyph_iter += 1;
+
     if (glyph_iter != glyphs_end) {
         LOG_ERROR("There are more chars in the text file than glyphs in the bitmap.");
         return 1;
     }
 
-    glyphs_print(glyphs, glyphs_end - glyphs);
+    qsort(glyphs, (size_t)(glyphs_end - glyphs), sizeof(Glyph), glyph_compare);
+
+    FILE *output_file = fopen("./out/font8x8.c", "wb");
+    if (output_file == NULL) {
+        LOG_ERROR("Failed to open an output file.");
+        return 1;
+    }
+    glyphs_export_as_c_array(glyphs, glyphs_end - glyphs, output_file);
+    fclose(output_file);
 
     return 0;
 }
